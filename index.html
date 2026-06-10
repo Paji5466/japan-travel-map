@@ -962,7 +962,17 @@
     <script src="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/leaflet-control-geocoder@2.4.0/dist/Control.Geocoder.js"></script>
     <script src="https://cdn.bootcdn.net/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script>
+        // ==================== Supabase 客户端 ====================
+        const SUPABASE_URL = 'https://gfvnvjsfpabllnlqwnhp.supabase.co';
+        const SUPABASE_ANON_KEY = 'sb_publishable_TYCfPWiPABAJ1F9w3Hl1JA_iUa96OqJ';
+        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        // 本客户端唯一标识（用于忽略自己的实时推送）
+        const CLIENT_ID = 'c_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+        const PENDING_OPS = new Set(); // 正在进行的操作ID（避免重复处理）
+
         // ==================== 全局状态 ====================
         let markers = [];
         let markerLayers = {};
@@ -972,8 +982,48 @@
         let currentImageData = null;
         let mapClickHandler = null;
         let lastReverseGeocode = 0; // 逆地理编码节流
+        let realtimeChannel = null;
 
         const STORAGE_KEY = 'japan_travel_markers';
+
+        // ==================== 数据库 ↔ JS 映射 ====================
+        function dbToMarker(row) {
+            return {
+                id: row.id,
+                name: row.name,
+                lat: row.lat,
+                lng: row.lng,
+                address: row.address || null,
+                date: row.date || '',
+                category: row.category || 'sightseeing',
+                desc: row.desc || '',
+                image: row.image || null,
+                visited: row.visited || false,
+                number: row.number || 0,
+                createdAt: row.created_at || new Date().toISOString(),
+                updatedAt: row.updated_at || new Date().toISOString(),
+                createdBy: row.created_by || null
+            };
+        }
+
+        function markerToDb(marker) {
+            return {
+                id: marker.id,
+                name: marker.name,
+                lat: marker.lat,
+                lng: marker.lng,
+                address: marker.address || null,
+                date: marker.date || '',
+                category: marker.category || 'sightseeing',
+                desc: marker.desc || '',
+                image: marker.image || null,
+                visited: marker.visited || false,
+                number: marker.number || 0,
+                created_at: marker.createdAt || new Date().toISOString(),
+                updated_at: marker.updatedAt || new Date().toISOString(),
+                created_by: marker.createdBy || null
+            };
+        }
 
         // 分类图标和颜色
         const categoryConfig = {
@@ -1062,7 +1112,132 @@
             document.body.removeChild(ta);
         }
 
-        // ==================== 地图初始化 ====================
+        // ==================== 实时同步 ====================
+        function subscribeToRealtime() {
+            if (realtimeChannel) {
+                supabase.removeChannel(realtimeChannel);
+            }
+
+            realtimeChannel = supabase
+                .channel('markers-realtime')
+                .on('postgres_changes', 
+                    { event: '*', schema: 'public', table: 'markers' },
+                    (payload) => {
+                        handleRealtimeChange(payload);
+                    }
+                )
+                .subscribe((status) => {
+                    if (status === 'SUBSCRIBED') {
+                        console.log('✅ 实时同步已连接');
+                    } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                        console.warn('⚠️ 实时同步断开，3秒后重连...');
+                        setTimeout(() => {
+                            subscribeToRealtime();
+                        }, 3000);
+                    }
+                });
+
+            console.log('🔄 正在连接实时同步...');
+        }
+
+        function handleRealtimeChange(payload) {
+            const { eventType, new: newRow, old: oldRow } = payload;
+            
+            if (eventType === 'INSERT') {
+                const marker = dbToMarker(newRow);
+                // 跳过自己发起的操作
+                if (PENDING_OPS.has(marker.id)) {
+                    // 但如果是自己添加的，可能本地还没渲染，需要更新
+                    const exists = markers.find(m => m.id === marker.id);
+                    if (!exists) {
+                        markers.push(marker);
+                        markers.forEach((m, i) => { m.number = i + 1; });
+                        renderMarkerOnMap(marker);
+                        updateMarkerList();
+                        updateCounts();
+                    }
+                    return;
+                }
+                // 检查是否已存在（防止重复）
+                const exists = markers.find(m => m.id === marker.id);
+                if (!exists) {
+                    markers.push(marker);
+                    markers.sort((a, b) => (a.number || 0) - (b.number || 0));
+                    markers.forEach((m, i) => { m.number = i + 1; });
+                    renderMarkerOnMap(marker);
+                    updateMarkerList();
+                    updateCounts();
+                    showHint(`📌 ${marker.name || '新标记'} - 来自云端同步`, 2500);
+                }
+
+            } else if (eventType === 'UPDATE') {
+                const updatedMarker = dbToMarker(newRow);
+                if (PENDING_OPS.has(updatedMarker.id)) return;
+
+                const idx = markers.findIndex(m => m.id === updatedMarker.id);
+                if (idx !== -1) {
+                    const oldVisited = markers[idx].visited;
+                    markers[idx] = updatedMarker;
+                    
+                    // 重新渲染该标记
+                    if (markerLayers[updatedMarker.id]) {
+                        try {
+                            markerLayers[updatedMarker.id].closePopup();
+                            if (map.hasLayer(markerLayers[updatedMarker.id])) {
+                                map.removeLayer(markerLayers[updatedMarker.id]);
+                            }
+                        } catch(e) {}
+                        delete markerLayers[updatedMarker.id];
+                    }
+                    renderMarkerOnMap(updatedMarker);
+                    updateMarkerList();
+                    updateCounts();
+
+                    if (oldVisited !== updatedMarker.visited) {
+                        showHint(updatedMarker.visited ? 
+                            `✅ ${updatedMarker.name || '标记'} 已标记为玩过 - 云端同步` : 
+                            `🔄 ${updatedMarker.name || '标记'} 已撤销玩过 - 云端同步`, 2500);
+                    }
+                }
+
+            } else if (eventType === 'DELETE') {
+                const deletedId = oldRow ? oldRow.id : null;
+                if (!deletedId) return;
+                if (PENDING_OPS.has(deletedId)) return;
+
+                const idx = markers.findIndex(m => m.id === deletedId);
+                if (idx !== -1) {
+                    const name = markers[idx].name;
+                    markers.splice(idx, 1);
+                    markers.forEach((m, i) => { m.number = i + 1; });
+
+                    if (markerLayers[deletedId]) {
+                        try {
+                            markerLayers[deletedId].closePopup();
+                            if (map.hasLayer(markerLayers[deletedId])) {
+                                map.removeLayer(markerLayers[deletedId]);
+                            }
+                        } catch(e) {}
+                        delete markerLayers[deletedId];
+                    }
+                    updateMarkerList();
+                    updateCounts();
+                    showHint(`🗑️ ${name || '标记'} 已被删除 - 云端同步`, 2500);
+                }
+
+                // 处理清空操作（大量删除）
+                if (markers.length === 0 && markerLayers && Object.keys(markerLayers).length > 0) {
+                    Object.keys(markerLayers).forEach(id => {
+                        try {
+                            if (map.hasLayer(markerLayers[id])) map.removeLayer(markerLayers[id]);
+                        } catch(e) {}
+                        delete markerLayers[id];
+                    });
+                    updateMarkerList();
+                    updateCounts();
+                }
+            }
+        }
         const map = L.map('map', {
             center: [35.68, 139.76], // 东京
             zoom: 12,
@@ -1122,25 +1297,113 @@
         setTimeout(() => showHint('在地图上点击即可添加标记 🗺️', 4000), 1000);
 
         // ==================== 数据管理 ====================
-        function loadMarkers() {
+        async function loadMarkers() {
+            try {
+                const { data, error } = await supabase
+                    .from('markers')
+                    .select('*')
+                    .order('number', { ascending: true });
+
+                if (error) {
+                    console.error('从 Supabase 加载失败，回退到本地:', error);
+                    loadFromLocalStorage();
+                    return;
+                }
+
+                if (data && data.length > 0) {
+                    markers = data.map(dbToMarker);
+                } else {
+                    markers = [];
+                }
+            } catch (e) {
+                console.error('加载数据失败:', e);
+                loadFromLocalStorage();
+            }
+        }
+
+        function loadFromLocalStorage() {
             try {
                 const data = localStorage.getItem(STORAGE_KEY);
                 if (data) {
                     markers = JSON.parse(data);
                 }
             } catch (e) {
-                console.error('加载数据失败:', e);
+                console.error('加载本地数据失败:', e);
                 markers = [];
             }
         }
 
-        function saveMarkers() {
+        async function saveMarkers() {
+            // 不再使用 localStorage 作为主要存储
+            // 数据已通过 Supabase 实时同步
+        }
+
+        async function saveMarkerToDB(markerData) {
+            const dbData = markerToDb(markerData);
+            PENDING_OPS.add(dbData.id);
+            try {
+                const { error } = await supabase
+                    .from('markers')
+                    .upsert(dbData, { onConflict: 'id' });
+
+                if (error) {
+                    console.error('保存到 Supabase 失败:', error);
+                    // 回退到 localStorage
+                    fallbackSaveToLocal(markerData);
+                }
+            } catch (e) {
+                console.error('保存异常:', e);
+                fallbackSaveToLocal(markerData);
+            }
+            // 延迟清除 pending 标记，确保实时推送不会重复处理
+            setTimeout(() => PENDING_OPS.delete(dbData.id), 2000);
+        }
+
+        async function deleteMarkerFromDB(id) {
+            PENDING_OPS.add(id);
+            try {
+                const { error } = await supabase
+                    .from('markers')
+                    .delete()
+                    .eq('id', id);
+
+                if (error) {
+                    console.error('从 Supabase 删除失败:', error);
+                }
+            } catch (e) {
+                console.error('删除异常:', e);
+            }
+            setTimeout(() => PENDING_OPS.delete(id), 2000);
+        }
+
+        async function clearAllFromDB() {
+            try {
+                const ids = markers.map(m => m.id);
+                ids.forEach(id => PENDING_OPS.add(id));
+                const { error } = await supabase
+                    .from('markers')
+                    .delete()
+                    .neq('id', '__nonexistent__'); // 安全删除全部
+
+                if (error) {
+                    console.error('清空 Supabase 失败:', error);
+                }
+            } catch (e) {
+                console.error('清空异常:', e);
+            }
+        }
+
+        function fallbackSaveToLocal(markerData) {
+            const idx = markers.findIndex(m => m.id === markerData.id);
+            if (idx !== -1) {
+                markers[idx] = markerData;
+            } else {
+                markers.push(markerData);
+            }
+            markers.forEach((m, i) => { m.number = i + 1; });
             try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
-            } catch (e) {
-                console.error('保存数据失败:', e);
-                showHint('保存失败，存储空间可能不足', 3000);
-            }
+            } catch(e) {}
         }
 
         function generateId() {
@@ -1491,23 +1754,22 @@
 
             // 重新编号
             markers.forEach((m, i) => { m.number = i + 1; });
+            // 同步 markerData 的 number
+            markerData.number = markers.find(m => m.id === markerData.id)?.number || markers.length;
 
-            // 先持久化
+            // 持久化到 Supabase（主要存储）+ localStorage（回退）
+            saveMarkerToDB(markerData);
             try {
-                saveMarkers();
-            } catch(e) {
-                console.error('保存失败:', e);
-            }
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
+            } catch(e) {}
 
             // 同步更新标记列表和地图
             if (editingMarkerId && markerLayers[editingMarkerId]) {
-                // 编辑：移除旧标记再添加新的
                 const oldLayer = markerLayers[editingMarkerId];
                 if (map.hasLayer(oldLayer)) map.removeLayer(oldLayer);
                 delete markerLayers[editingMarkerId];
                 renderMarkerOnMap(markerData);
-            } else if (isNew) {
-                // 新增：直接渲染
+            } else if (!editingMarkerId) {
                 renderMarkerOnMap(markerData);
             }
 
@@ -1543,7 +1805,12 @@
             if (!marker) return;
             marker.visited = !marker.visited;
             marker.updatedAt = new Date().toISOString();
-            saveMarkers();
+            
+            // 同步到 Supabase + localStorage 回退
+            saveMarkerToDB(marker);
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
+            } catch(e) {}
 
             // 移除旧图层，重新渲染该标记
             if (markerLayers[id]) {
@@ -1565,26 +1832,27 @@
         function deleteMarkerById(id) {
             if (!confirm('确定要删除这个标记吗？此操作不可撤销。')) return;
             
-            // 先从数组中移除
-            markers = markers.filter(m => m.id !== id);
-            markers.forEach((m, i) => { m.number = i + 1; });
-            saveMarkers();
-            
-            // 先关闭该标记的弹出窗口（避免移除时 Leaflet 出错）
+            // 先关闭弹出窗口
             if (markerLayers[id]) {
                 try {
                     markerLayers[id].closePopup();
                     if (map.hasLayer(markerLayers[id])) map.removeLayer(markerLayers[id]);
-                } catch(e) {
-                    console.warn('移除图层失败:', e);
-                }
+                } catch(e) {}
                 delete markerLayers[id];
             }
+
+            // 从本地数组移除
+            markers = markers.filter(m => m.id !== id);
+            markers.forEach((m, i) => { m.number = i + 1; });
+
+            // 同步到 Supabase + localStorage 回退
+            deleteMarkerFromDB(id);
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
+            } catch(e) {}
             
-            // 立即更新列表和数字
             updateMarkerList();
             updateCounts();
-            
             showHint('标记已删除', 2000);
         }
 
@@ -1602,7 +1870,13 @@
             markerLayers = {};
             
             markers = [];
-            saveMarkers();
+            
+            // 同步到 Supabase + localStorage
+            clearAllFromDB();
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
+            } catch(e) {}
+            
             updateMarkerList();
             updateCounts();
             showHint('所有标记已清空', 2000);
@@ -1727,29 +2001,33 @@
             showHint('数据已导出 ✅', 2000);
         }
 
-        function importMarkers(event) {
+        async function importMarkers(event) {
             const file = event.target.files[0];
             if (!file) return;
 
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 try {
                     const data = JSON.parse(e.target.result);
                     if (!Array.isArray(data)) throw new Error('格式错误');
 
                     const importCount = data.length;
-                    // 合并导入（相同位置的标记不会重复添加，通过ID去重）
+                    // 合并导入（通过ID去重）
                     const existingIds = new Set(markers.map(m => m.id));
                     let addedCount = 0;
-                    data.forEach(m => {
+                    for (const m of data) {
                         if (!existingIds.has(m.id)) {
                             markers.push(m);
                             addedCount++;
+                            // 同步到云端
+                            await saveMarkerToDB(m);
                         }
-                    });
+                    }
 
                     markers.forEach((m, i) => { m.number = i + 1; });
-                    saveMarkers();
+                    try {
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
+                    } catch(e) {}
                     renderAllMarkers();
                     fitAllMarkers();
                     showHint(`成功导入 ${addedCount} 个新标记（共 ${importCount} 条数据）`, 3000);
@@ -1790,42 +2068,74 @@
         window.addEventListener('resize', handleResize);
 
         // ==================== 初始化 ====================
-        function init() {
-            loadMarkers();
+        async function init() {
+            // 1. 先加载本地数据（如果存在）
+            loadFromLocalStorage();
+            const localCount = markers.length;
+
+            // 2. 从 Supabase 加载云端数据
+            await loadMarkers();
+            const cloudCount = markers.length;
+
+            // 3. 如果本地有数据但云端没有，把本地数据迁移到云端
+            if (localCount > 0 && cloudCount === 0) {
+                console.log('📤 检测到本地数据，正在迁移到云端...');
+                loadFromLocalStorage(); // 重新加载本地数据
+                for (const m of markers) {
+                    await saveMarkerToDB(m);
+                }
+                showHint(`已迁移 ${markers.length} 条本地数据到云端 ☁️`, 3000);
+            }
+
+            // 4. 确保编号正确
+            markers.forEach((m, i) => { m.number = i + 1; });
+
+            // 5. 渲染地图
             renderAllMarkers();
             if (markers.length > 0) {
                 fitAllMarkers();
             }
 
-            // 添加一些示例标记（首次使用时）
-            if (markers.length === 0 && !localStorage.getItem(STORAGE_KEY + '_initialized')) {
+            // 6. 启动实时同步
+            subscribeToRealtime();
+
+            // 7. 保存到 localStorage 作为离线缓存
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
+            } catch(e) {}
+
+            // 8. 添加示例标记（仅当完全没有任何数据时）
+            if (markers.length === 0 && !localStorage.getItem('japan_travel_cloud_initialized')) {
                 const samples = [
                     { name: '东京塔', lat: 35.6586, lng: 139.7454, category: 'sightseeing', desc: '东京标志性建筑，夜景很美', date: '', visited: false },
                     { name: '浅草寺', lat: 35.7148, lng: 139.7967, category: 'sightseeing', desc: '东京最古老的寺庙', date: '', visited: false },
                     { name: '涩谷十字路口', lat: 35.6595, lng: 139.7004, category: 'shopping', desc: '世界最繁忙的十字路口', date: '', visited: false },
                 ];
-                samples.forEach(s => {
-                    markers.push({
+                for (const s of samples) {
+                    const m = {
                         id: generateId(),
                         ...s,
+                        address: null,
                         image: null,
                         createdAt: new Date().toISOString(),
-                        updatedAt: new Date().toISOString()
-                    });
-                });
-                markers.forEach((m, i) => { m.number = i + 1; });
-                saveMarkers();
+                        updatedAt: new Date().toISOString(),
+                        createdBy: null,
+                        number: markers.length + 1
+                    };
+                    markers.push(m);
+                    await saveMarkerToDB(m);
+                }
                 renderAllMarkers();
                 fitAllMarkers();
-                localStorage.setItem(STORAGE_KEY + '_initialized', '1');
+                localStorage.setItem('japan_travel_cloud_initialized', '1');
             }
+
+            console.log('🗾 日本旅行地图已就绪！');
+            console.log('☁️ 已接入 Supabase 实时同步');
+            console.log('👥 多人协作：所有人看到的标记实时同步');
         }
 
         init();
-
-        console.log('🗾 日本旅行地图已就绪！');
-        console.log('💡 提示：在地图上点击添加标记，支持文本和图片');
-        console.log('📱 数据保存在浏览器本地存储中');
     </script>
 </body>
 </html>
