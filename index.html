@@ -962,12 +962,29 @@
     <script src="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/leaflet-control-geocoder@2.4.0/dist/Control.Geocoder.js"></script>
     <script src="https://cdn.bootcdn.net/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script>
+        // ==================== 动态加载 Supabase SDK ====================
+        // 使用动态加载避免 CDN 被墙导致整个页面卡死
+        var _supabaseSDKLoaded = false;
+        (function() {
+            var s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+            s.onload = function() { _supabaseSDKLoaded = true; };
+            s.onerror = function() {
+                // jsdelivr 被墙，尝试 unpkg
+                var s2 = document.createElement('script');
+                s2.src = 'https://unpkg.com/@supabase/supabase-js@2';
+                s2.onload = function() { _supabaseSDKLoaded = true; };
+                s2.onerror = function() { console.warn('⚠️ Supabase SDK 全部加载失败，使用离线模式'); };
+                document.head.appendChild(s2);
+            };
+            document.head.appendChild(s);
+        })();
+
         // ==================== Supabase 客户端 ====================
         const SUPABASE_URL = 'https://gfvnvjsfpabllnlqwnhp.supabase.co';
         const SUPABASE_ANON_KEY = 'sb_publishable_TYCfPWiPABAJ1F9w3Hl1JA_iUa96OqJ';
-        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        let supabase = null; // 将在 SDK 加载后通过 initSupabase() 初始化
 
         // 本客户端唯一标识（用于忽略自己的实时推送）
         const CLIENT_ID = 'c_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
@@ -1114,6 +1131,10 @@
 
         // ==================== 实时同步 ====================
         function subscribeToRealtime() {
+            if (!supabase) {
+                console.log('📴 Supabase 不可用，跳过实时同步');
+                return;
+            }
             if (realtimeChannel) {
                 supabase.removeChannel(realtimeChannel);
             }
@@ -1298,6 +1319,10 @@
 
         // ==================== 数据管理 ====================
         async function loadMarkers() {
+            if (!supabase) {
+                loadFromLocalStorage();
+                return;
+            }
             try {
                 const { data, error } = await supabase
                     .from('markers')
@@ -1339,6 +1364,10 @@
         }
 
         async function saveMarkerToDB(markerData) {
+            if (!supabase) {
+                fallbackSaveToLocal(markerData);
+                return;
+            }
             const dbData = markerToDb(markerData);
             PENDING_OPS.add(dbData.id);
             try {
@@ -1360,6 +1389,7 @@
         }
 
         async function deleteMarkerFromDB(id) {
+            if (!supabase) return;
             PENDING_OPS.add(id);
             try {
                 const { error } = await supabase
@@ -1377,6 +1407,7 @@
         }
 
         async function clearAllFromDB() {
+            if (!supabase) return;
             try {
                 const ids = markers.map(m => m.id);
                 ids.forEach(id => PENDING_OPS.add(id));
@@ -2073,11 +2104,15 @@
             loadFromLocalStorage();
             const localCount = markers.length;
 
-            // 2. 从 Supabase 加载云端数据
+            // 2. 等待 Supabase SDK 加载（最多等 5 秒）
+            await waitForSupabase(5000);
+            initSupabase();
+
+            // 3. 从 Supabase 加载云端数据
             await loadMarkers();
             const cloudCount = markers.length;
 
-            // 3. 如果本地有数据但云端没有，把本地数据迁移到云端
+            // 4. 如果本地有数据但云端没有，把本地数据迁移到云端
             if (localCount > 0 && cloudCount === 0) {
                 console.log('📤 检测到本地数据，正在迁移到云端...');
                 loadFromLocalStorage(); // 重新加载本地数据
@@ -2087,24 +2122,24 @@
                 showHint(`已迁移 ${markers.length} 条本地数据到云端 ☁️`, 3000);
             }
 
-            // 4. 确保编号正确
+            // 5. 确保编号正确
             markers.forEach((m, i) => { m.number = i + 1; });
 
-            // 5. 渲染地图
+            // 6. 渲染地图
             renderAllMarkers();
             if (markers.length > 0) {
                 fitAllMarkers();
             }
 
-            // 6. 启动实时同步
+            // 7. 启动实时同步
             subscribeToRealtime();
 
-            // 7. 保存到 localStorage 作为离线缓存
+            // 8. 保存到 localStorage 作为离线缓存
             try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
             } catch(e) {}
 
-            // 8. 添加示例标记（仅当完全没有任何数据时）
+            // 9. 添加示例标记（仅当完全没有任何数据时）
             if (markers.length === 0 && !localStorage.getItem('japan_travel_cloud_initialized')) {
                 const samples = [
                     { name: '东京塔', lat: 35.6586, lng: 139.7454, category: 'sightseeing', desc: '东京标志性建筑，夜景很美', date: '', visited: false },
@@ -2131,8 +2166,46 @@
             }
 
             console.log('🗾 日本旅行地图已就绪！');
-            console.log('☁️ 已接入 Supabase 实时同步');
-            console.log('👥 多人协作：所有人看到的标记实时同步');
+            if (supabase) {
+                console.log('☁️ 已接入 Supabase 实时同步');
+                console.log('👥 多人协作：所有人看到的标记实时同步');
+            } else {
+                console.log('💾 离线模式：数据保存在本地存储');
+            }
+        }
+
+        // 等待 Supabase SDK 加载
+        function waitForSupabase(timeoutMs) {
+            return new Promise(function(resolve) {
+                if (window.supabase) { resolve(); return; }
+                var start = Date.now();
+                var timer = setInterval(function() {
+                    if (window.supabase) {
+                        clearInterval(timer);
+                        resolve();
+                    } else if (Date.now() - start > timeoutMs) {
+                        clearInterval(timer);
+                        console.warn('⏰ Supabase SDK 加载超时，使用离线模式');
+                        resolve();
+                    }
+                }, 200);
+            });
+        }
+
+        // 初始化 Supabase 客户端（SDK 加载后调用）
+        function initSupabase() {
+            if (supabase) return; // 已经初始化过
+            try {
+                if (window.supabase && typeof window.supabase.createClient === 'function') {
+                    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                    console.log('✅ Supabase 客户端已初始化');
+                } else {
+                    console.warn('⚠️ Supabase SDK 未加载，将使用本地存储模式');
+                }
+            } catch (e) {
+                console.error('Supabase 初始化失败:', e);
+                supabase = null;
+            }
         }
 
         init();
