@@ -116,6 +116,47 @@
             color: var(--primary);
         }
 
+        /* 同步状态指示器 */
+        .sync-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            background: #f0f0f0;
+            color: #888;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: all var(--transition);
+            font-family: inherit;
+            border: none;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        .sync-status:hover {
+            background: #e8e8e8;
+        }
+        .sync-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .sync-dot.online { background: #27ae60; box-shadow: 0 0 6px rgba(39,174,96,0.5); animation: pulse-dot 2s infinite; }
+        .sync-dot.connecting { background: #f39c12; animation: pulse-dot 0.8s infinite; }
+        .sync-dot.offline { background: #e74c3c; }
+        .sync-dot.local { background: #95a5a6; }
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .sync-text { font-weight: 500; }
+        @media (max-width: 768px) {
+            .sync-text { display: none; }
+        }
+        }
+
         .btn-sm {
             padding: 5px 10px;
             font-size: 12px;
@@ -818,6 +859,47 @@
                 display: none;
             }
         }
+
+        /* 同步状态弹窗 */
+        .sync-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.35);
+            z-index: 2000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .sync-popup {
+            background: var(--card-bg);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            max-width: 400px;
+            width: 90%;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+        }
+        .sync-popup h4 {
+            font-size: 16px;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .sync-popup h4 i { color: var(--primary); }
+        #syncDetail p {
+            font-size: 13px;
+            color: var(--text-light);
+            margin-bottom: 6px;
+            line-height: 1.5;
+        }
+        #syncDetail .ok { color: #27ae60; font-weight: 600; }
+        #syncDetail .err { color: #e74c3c; font-weight: 600; }
+        #syncDetail .warn { color: #f39c12; font-weight: 600; }
+        .sync-actions {
+            margin-top: 16px;
+            display: flex;
+            gap: 4px;
+        }
     </style>
 </head>
 <body>
@@ -829,6 +911,10 @@
             <span>日本旅行地图</span>
         </div>
         <div class="navbar-actions">
+            <button id="syncStatusBtn" class="sync-status" onclick="toggleSyncStatus()" title="点击查看同步状态">
+                <span class="sync-dot connecting" id="syncDot"></span>
+                <span class="sync-text" id="syncLabel">连接中...</span>
+            </button>
             <button class="btn btn-outline btn-sm" onclick="exportMarkers()" title="导出数据">
                 <i class="fas fa-download"></i><span class="btn-text">导出</span>
             </button>
@@ -955,6 +1041,24 @@
             <div class="modal-footer">
                 <button class="btn btn-outline" onclick="closeModal()">取消</button>
                 <button class="btn btn-primary" onclick="saveMarker()" id="saveBtn">保存标记</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 同步状态详情弹窗 -->
+    <div class="sync-overlay" id="syncOverlay" style="display:none;">
+        <div class="sync-popup">
+            <h4><i class="fas fa-cloud"></i> 数据同步状态</h4>
+            <div id="syncDetail">
+                <p>正在检测连接...</p>
+            </div>
+            <div class="sync-actions">
+                <button class="btn btn-outline btn-sm" onclick="retryCloudSync()" id="retrySyncBtn">
+                    <i class="fas fa-sync-alt"></i> 重试连接
+                </button>
+                <button class="btn btn-outline btn-sm" onclick="document.getElementById('syncOverlay').style.display='none'" style="margin-left:4px;">
+                    <i class="fas fa-times"></i> 关闭
+                </button>
             </div>
         </div>
     </div>
@@ -1150,8 +1254,10 @@
                 .subscribe((status) => {
                     if (status === 'SUBSCRIBED') {
                         console.log('✅ 实时同步已连接');
+                        updateSyncStatus('online');
                     } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
                         console.warn('⚠️ 实时同步断开，3秒后重连...');
+                        updateSyncStatus('offline');
                         setTimeout(() => {
                             subscribeToRealtime();
                         }, 3000);
@@ -1366,6 +1472,11 @@
         async function saveMarkerToDB(markerData) {
             if (!supabase) {
                 fallbackSaveToLocal(markerData);
+                // 如果是新增操作，提示用户当前为离线模式
+                var existed = markers.findIndex(function(m) { return m.id === markerData.id; });
+                if (existed === -1) {
+                    console.warn('💾 离线模式：标记已保存到本地（不同设备间暂不同步）');
+                }
                 return;
             }
             const dbData = markerToDb(markerData);
@@ -1377,19 +1488,21 @@
 
                 if (error) {
                     console.error('保存到 Supabase 失败:', error);
-                    // 回退到 localStorage
                     fallbackSaveToLocal(markerData);
+                    if (_syncState === 'online') updateSyncStatus('offline');
                 }
+                // 同时更新 localStorage 作为缓存
+                try { localStorage.setItem(STORAGE_KEY, JSON.stringify(markers)); } catch(e) {}
             } catch (e) {
                 console.error('保存异常:', e);
                 fallbackSaveToLocal(markerData);
+                if (_syncState === 'online') updateSyncStatus('offline');
             }
-            // 延迟清除 pending 标记，确保实时推送不会重复处理
             setTimeout(() => PENDING_OPS.delete(dbData.id), 2000);
         }
 
         async function deleteMarkerFromDB(id) {
-            if (!supabase) return;
+            if (!supabase) return; // 已经在 markers 数组中删除了
             PENDING_OPS.add(id);
             try {
                 const { error } = await supabase
@@ -1399,9 +1512,13 @@
 
                 if (error) {
                     console.error('从 Supabase 删除失败:', error);
+                    if (_syncState === 'online') updateSyncStatus('offline');
                 }
+                // 同时更新 localStorage
+                try { localStorage.setItem(STORAGE_KEY, JSON.stringify(markers)); } catch(e) {}
             } catch (e) {
                 console.error('删除异常:', e);
+                if (_syncState === 'online') updateSyncStatus('offline');
             }
             setTimeout(() => PENDING_OPS.delete(id), 2000);
         }
@@ -1819,7 +1936,13 @@
                 map.flyTo([markerData.lat, markerData.lng], 16, { duration: 0.5 });
             }
 
-            showHint(isNew ? '标记已添加 ✅' : '标记已更新 ✅', 2000);
+            var hintMsg = isNew ? '标记已添加 ✅' : '标记已更新 ✅';
+            if (_syncState === 'online') {
+                hintMsg += ' ☁️已同步';
+            } else if (!supabase) {
+                hintMsg += ' 💾仅本地';
+            }
+            showHint(hintMsg, 2000);
             
             // 确保数字一定更新（双重保险）
             requestAnimationFrame(() => updateCounts());
@@ -2098,114 +2221,282 @@
         }
         window.addEventListener('resize', handleResize);
 
-        // ==================== 初始化 ====================
-        async function init() {
-            // 1. 先加载本地数据（如果存在）
-            loadFromLocalStorage();
-            const localCount = markers.length;
+        // ==================== 同步状态管理 ====================
+        var _syncState = 'connecting'; // 'connecting' | 'online' | 'offline' | 'local'
+        var _syncRetryTimer = null;
+        var _syncInitialized = false;
 
-            // 2. 等待 Supabase SDK 加载（最多等 5 秒）
-            await waitForSupabase(5000);
-            initSupabase();
+        function updateSyncStatus(state, detailHtml) {
+            _syncState = state;
+            var dot = document.getElementById('syncDot');
+            var label = document.getElementById('syncLabel');
+            var detail = document.getElementById('syncDetail');
 
-            // 3. 从 Supabase 加载云端数据
-            await loadMarkers();
-            const cloudCount = markers.length;
+            if (dot) {
+                dot.className = 'sync-dot ' + state;
+            }
+            if (label) {
+                var labels = {
+                    connecting: '连接中...',
+                    online: '已同步',
+                    offline: '未连接',
+                    local: '离线模式'
+                };
+                label.textContent = labels[state] || state;
+            }
+            if (detail && detailHtml !== undefined) {
+                detail.innerHTML = detailHtml;
+            }
+        }
 
-            // 4. 如果本地有数据但云端没有，把本地数据迁移到云端
-            if (localCount > 0 && cloudCount === 0) {
-                console.log('📤 检测到本地数据，正在迁移到云端...');
-                loadFromLocalStorage(); // 重新加载本地数据
-                for (const m of markers) {
-                    await saveMarkerToDB(m);
+        function toggleSyncStatus() {
+            var overlay = document.getElementById('syncOverlay');
+            if (!_syncInitialized) {
+                // 刷新详情
+                refreshSyncDetail();
+            }
+            if (overlay.style.display === 'none' || !overlay.style.display) {
+                overlay.style.display = 'flex';
+                refreshSyncDetail();
+            } else {
+                overlay.style.display = 'none';
+            }
+        }
+
+        function refreshSyncDetail() {
+            var detail = document.getElementById('syncDetail');
+            var html = '';
+            if (supabase) {
+                html += '<p><span class="ok">SDK 已加载</span> — Supabase 客户端已创建</p>';
+                html += '<p><span class="ok">项目地址：</span>' + SUPABASE_URL + '</p>';
+                if (_syncState === 'online') {
+                    html += '<p><span class="ok">云端连接正常</span> — 数据实时同步中</p>';
+                    html += '<p style="font-size:12px;color:#888;">你的标记在手机和电脑之间自动同步 ☁️</p>';
+                } else if (_syncState === 'offline' || _syncState === 'connecting') {
+                    html += '<p><span class="warn">正在尝试连接云端...</span></p>';
+                    html += '<p style="font-size:12px;color:#888;">连接成功后，数据将自动同步到其他设备</p>';
                 }
-                showHint(`已迁移 ${markers.length} 条本地数据到云端 ☁️`, 3000);
+            } else {
+                html += '<p><span class="err">Supabase SDK 未加载</span></p>';
+                html += '<p style="font-size:12px;color:#888;">可能原因：</p>';
+                html += '<p style="font-size:12px;color:#888;">1. CDN (jsdelivr/unpkg) 被墙</p>';
+                html += '<p style="font-size:12px;color:#888;">2. 网络连接问题</p>';
+                html += '<p><span class="warn">当前使用离线模式</span> — 数据保存在本地浏览器中</p>';
+                html += '<p style="font-size:12px;color:#e74c3c;">⚠ 不同设备之间的数据不会同步</p>';
+            }
+            detail.innerHTML = html;
+        }
+
+        function retryCloudSync() {
+            updateSyncStatus('connecting', '<p>正在重新连接...</p>');
+            if (!window.supabase) {
+                // 重新尝试加载 SDK
+                tryLoadSupabaseSDK();
+                updateSyncStatus('connecting', '<p>正在重新加载 Supabase SDK...</p>');
+            }
+            initCloudSync().then(function() {
+                refreshSyncDetail();
+            });
+        }
+
+        function tryLoadSupabaseSDK() {
+            if (window.supabase) return;
+            var s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+            s.onerror = function() {
+                var s2 = document.createElement('script');
+                s2.src = 'https://unpkg.com/@supabase/supabase-js@2';
+                s2.onerror = function() {
+                    console.warn('⚠️ Supabase SDK 全部加载失败');
+                };
+                document.head.appendChild(s2);
+            };
+            document.head.appendChild(s);
+        }
+
+        // ==================== 云端同步初始化（异步，不阻塞地图） ====================
+        function initSupabase() {
+            if (supabase) return true; // 已经初始化过
+            try {
+                if (window.supabase && typeof window.supabase.createClient === 'function') {
+                    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                    console.log('✅ Supabase 客户端已初始化');
+                    return true;
+                } else {
+                    console.warn('⚠️ Supabase SDK 未加载');
+                    return false;
+                }
+            } catch (e) {
+                console.error('Supabase 初始化失败:', e);
+                supabase = null;
+                return false;
+            }
+        }
+
+        async function initCloudSync() {
+            if (!window.supabase) {
+                // SDK 还没加载
+                updateSyncStatus('connecting', '<p>等待 Supabase SDK 加载...</p>');
+                // 等待 SDK 加载（最多 8 秒）
+                var waited = 0;
+                while (!window.supabase && waited < 8000) {
+                    await new Promise(function(r) { setTimeout(r, 500); });
+                    waited += 500;
+                }
             }
 
-            // 5. 确保编号正确
-            markers.forEach((m, i) => { m.number = i + 1; });
+            if (!initSupabase()) {
+                updateSyncStatus('local',
+                    '<p><span class="warn">SDK 加载失败</span></p>' +
+                    '<p style="font-size:12px;color:#888;">无法连接到云端数据库</p>' +
+                    '<p style="font-size:12px;color:#e74c3c;">⚠ 不同设备之间的数据不会同步</p>');
+                scheduleSyncRetry();
+                return;
+            }
 
-            // 6. 渲染地图
+            updateSyncStatus('connecting', '<p>正在连接云端数据库...</p>');
+
+            // 尝试从云端加载数据
+            try {
+                var _localMarkers = JSON.parse(JSON.stringify(markers)); // 保存本地数据副本
+                var { data, error } = await supabase
+                    .from('markers')
+                    .select('*')
+                    .order('number', { ascending: true });
+
+                if (error) {
+                    console.error('❌ 云端加载失败:', JSON.stringify(error));
+                    updateSyncStatus('offline',
+                        '<p><span class="err">云端连接失败</span></p>' +
+                        '<p style="font-size:12px;color:#888;">错误：' + escapeHtml(String(error.message || error.code || JSON.stringify(error))) + '</p>' +
+                        '<p style="font-size:12px;color:#f39c12;">数据暂时保存在本地，连接恢复后自动同步</p>');
+                    scheduleSyncRetry();
+                    // 确保本地数据还在
+                    if (markers.length === 0 && _localMarkers.length > 0) {
+                        markers = _localMarkers;
+                        renderAllMarkers();
+                    }
+                    return;
+                }
+
+                if (data && data.length > 0) {
+                    // 云端有数据，使用云端数据
+                    markers = data.map(dbToMarker);
+                    console.log('📥 从云端加载了 ' + markers.length + ' 条标记');
+                } else if (_localMarkers.length > 0) {
+                    // 云端为空但本地有数据 → 迁移到云端
+                    console.log('📤 云端无数据，迁移本地 ' + _localMarkers.length + ' 条到云端...');
+                    markers = _localMarkers;
+                    for (var mi = 0; mi < markers.length; mi++) {
+                        try {
+                            var dbData = markerToDb(markers[mi]);
+                            await supabase.from('markers').upsert(dbData, { onConflict: 'id' });
+                        } catch(me) {
+                            console.error('迁移失败:', me);
+                        }
+                    }
+                    console.log('📤 本地数据迁移完成');
+                } else {
+                    markers = [];
+                }
+
+                // 成功连接！
+                updateSyncStatus('online',
+                    '<p><span class="ok">云端连接成功！</span></p>' +
+                    '<p style="font-size:12px;color:#888;">当前云端有 ' + markers.length + ' 条标记</p>' +
+                    '<p style="font-size:12px;color:#27ae60;">✅ 手机和电脑之间数据自动同步</p>');
+
+                // 重新编号 & 渲染
+                markers.forEach(function(m, i) { m.number = i + 1; });
+                renderAllMarkers();
+                if (markers.length > 0) fitAllMarkers();
+
+                // 保存到 localStorage 作为离线缓存
+                try { localStorage.setItem(STORAGE_KEY, JSON.stringify(markers)); } catch(e) {}
+
+                // 启动实时同步
+                subscribeToRealtime();
+
+                // 添加示例标记（仅当完全没有任何数据时）
+                if (markers.length === 0 && !localStorage.getItem('japan_travel_cloud_initialized')) {
+                    addSampleMarkers();
+                }
+
+                console.log('☁️ 云端同步已就绪！');
+                _syncInitialized = true;
+                clearSyncRetry();
+
+            } catch (e) {
+                console.error('❌ 云端初始化异常:', e);
+                updateSyncStatus('offline',
+                    '<p><span class="err">连接异常</span></p>' +
+                    '<p style="font-size:12px;color:#888;">' + escapeHtml(String(e.message || e)) + '</p>' +
+                    '<p style="font-size:12px;color:#f39c12;">数据保存在本地，稍后自动重试</p>');
+                scheduleSyncRetry();
+            }
+        }
+
+        function addSampleMarkers() {
+            var samples = [
+                { name: '东京塔', lat: 35.6586, lng: 139.7454, category: 'sightseeing', desc: '东京标志性建筑，夜景很美', date: '', visited: false },
+                { name: '浅草寺', lat: 35.7148, lng: 139.7967, category: 'sightseeing', desc: '东京最古老的寺庙', date: '', visited: false },
+                { name: '涩谷十字路口', lat: 35.6595, lng: 139.7004, category: 'shopping', desc: '世界最繁忙的十字路口', date: '', visited: false },
+            ];
+            samples.forEach(function(s) {
+                var m = {
+                    id: generateId(),
+                    name: s.name, lat: s.lat, lng: s.lng, category: s.category, desc: s.desc,
+                    date: '', visited: false,
+                    address: null, image: null,
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                    createdBy: null,
+                    number: markers.length + 1
+                };
+                markers.push(m);
+                if (supabase) saveMarkerToDB(m);
+            });
+            renderAllMarkers();
+            fitAllMarkers();
+            localStorage.setItem('japan_travel_cloud_initialized', '1');
+        }
+
+        function scheduleSyncRetry() {
+            clearSyncRetry();
+            _syncRetryTimer = setTimeout(function() {
+                console.log('🔄 自动重试云端连接...');
+                initCloudSync();
+            }, 30000); // 30 秒后重试
+        }
+
+        function clearSyncRetry() {
+            if (_syncRetryTimer) {
+                clearTimeout(_syncRetryTimer);
+                _syncRetryTimer = null;
+            }
+        }
+
+        // ==================== 初始化 ====================
+        function init() {
+            // 1. 立即从本地加载数据并渲染地图（不等待云端）
+            loadFromLocalStorage();
+            markers.forEach(function(m, i) { m.number = i + 1; });
             renderAllMarkers();
             if (markers.length > 0) {
                 fitAllMarkers();
             }
 
-            // 7. 启动实时同步
-            subscribeToRealtime();
-
-            // 8. 保存到 localStorage 作为离线缓存
-            try {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(markers));
-            } catch(e) {}
-
-            // 9. 添加示例标记（仅当完全没有任何数据时）
+            // 添加示例标记
             if (markers.length === 0 && !localStorage.getItem('japan_travel_cloud_initialized')) {
-                const samples = [
-                    { name: '东京塔', lat: 35.6586, lng: 139.7454, category: 'sightseeing', desc: '东京标志性建筑，夜景很美', date: '', visited: false },
-                    { name: '浅草寺', lat: 35.7148, lng: 139.7967, category: 'sightseeing', desc: '东京最古老的寺庙', date: '', visited: false },
-                    { name: '涩谷十字路口', lat: 35.6595, lng: 139.7004, category: 'shopping', desc: '世界最繁忙的十字路口', date: '', visited: false },
-                ];
-                for (const s of samples) {
-                    const m = {
-                        id: generateId(),
-                        ...s,
-                        address: null,
-                        image: null,
-                        createdAt: new Date().toISOString(),
-                        updatedAt: new Date().toISOString(),
-                        createdBy: null,
-                        number: markers.length + 1
-                    };
-                    markers.push(m);
-                    await saveMarkerToDB(m);
-                }
-                renderAllMarkers();
-                fitAllMarkers();
-                localStorage.setItem('japan_travel_cloud_initialized', '1');
+                addSampleMarkers();
             }
 
-            console.log('🗾 日本旅行地图已就绪！');
-            if (supabase) {
-                console.log('☁️ 已接入 Supabase 实时同步');
-                console.log('👥 多人协作：所有人看到的标记实时同步');
-            } else {
-                console.log('💾 离线模式：数据保存在本地存储');
-            }
-        }
+            console.log('🗾 日本旅行地图已就绪（本地模式）');
+            console.log('🔄 正在后台连接云端同步...');
 
-        // 等待 Supabase SDK 加载
-        function waitForSupabase(timeoutMs) {
-            return new Promise(function(resolve) {
-                if (window.supabase) { resolve(); return; }
-                var start = Date.now();
-                var timer = setInterval(function() {
-                    if (window.supabase) {
-                        clearInterval(timer);
-                        resolve();
-                    } else if (Date.now() - start > timeoutMs) {
-                        clearInterval(timer);
-                        console.warn('⏰ Supabase SDK 加载超时，使用离线模式');
-                        resolve();
-                    }
-                }, 200);
-            });
-        }
-
-        // 初始化 Supabase 客户端（SDK 加载后调用）
-        function initSupabase() {
-            if (supabase) return; // 已经初始化过
-            try {
-                if (window.supabase && typeof window.supabase.createClient === 'function') {
-                    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-                    console.log('✅ Supabase 客户端已初始化');
-                } else {
-                    console.warn('⚠️ Supabase SDK 未加载，将使用本地存储模式');
-                }
-            } catch (e) {
-                console.error('Supabase 初始化失败:', e);
-                supabase = null;
-            }
+            // 2. 后台异步连接云端（不阻塞地图使用）
+            updateSyncStatus('connecting', '<p>正在连接云端数据库...</p>');
+            initCloudSync();
         }
 
         init();
